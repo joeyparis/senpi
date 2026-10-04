@@ -1,3 +1,21 @@
+## 2026-10-04 - Serialize shared token-budget initialization
+
+### What changed
+
+- `packages/coding-agent/src/core/token-budget.ts` (fork-only): acquire the root lock before creating its directory. Add event-synchronized subprocess tests for initialization contention, shared tree/session admission before provider dispatch, durable reservations, and reconciliation including cached input.
+
+### Why
+
+- A contender previously created the root directory before failing lock acquisition. The legitimate initializer then rejected the missing ledger with `ENOENT`. The regression test reproduces this interleaving without sleeps.
+
+### Why an extension could not handle it
+
+- `packages/coding-agent/src/core/token-budget.ts` owns atomic shared admission and initialization before physical requests; extension callbacks cannot serialize its filesystem operations.
+
+### Expected merge conflict zones
+
+- `packages/coding-agent/src/core/token-budget.ts`: the directory creation and lock acquisition in `transact`. The persistence format and existing fail-closed behavior for missing or corrupt initialized ledgers are unchanged.
+
 ## 2026-10-01 - Share shipped package resolution with read permissions (#2513)
 
 ### What changed
