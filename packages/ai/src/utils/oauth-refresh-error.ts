@@ -52,6 +52,26 @@ export function classifyOAuthRefreshFailure(error: unknown): "transient" | "perm
 }
 
 const UNAVAILABLE = Symbol.for("senpi.oauthRefreshUnavailable");
+const REJECTED = Symbol.for("senpi.oauthRefreshRejected");
+
+export class OAuthRefreshRejectedError extends ModelsError {
+	readonly [REJECTED] = true;
+
+	constructor(provider: string, cause: unknown) {
+		super("oauth", `OAuth refresh failed for ${provider}`, { cause });
+		this.name = "OAuthRefreshRejectedError";
+	}
+}
+
+export function isOAuthRefreshRejectedError(error: unknown): error is OAuthRefreshRejectedError {
+	const seen = new Set<unknown>();
+	while (typeof error === "object" && error !== null && !seen.has(error) && seen.size < MAX_CAUSE_LINKS) {
+		seen.add(error);
+		if (Reflect.get(error, REJECTED) === true) return true;
+		error = Reflect.get(error, "cause");
+	}
+	return false;
+}
 
 export class OAuthRefreshUnavailableError extends ModelsError {
 	readonly [UNAVAILABLE] = true;

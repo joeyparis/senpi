@@ -1530,7 +1530,7 @@ export class AgentSession {
 	}> {
 		let result: AuthResult | undefined;
 		try {
-			result = await this._modelRuntime.getAuth(model, { signal });
+			result = await this._modelRuntime.getAuth(model, { signal, sessionId: this.sessionId });
 		} catch (error) {
 			const cause = error instanceof Error ? error.cause : undefined;
 			if (cause instanceof Error && cause.message === "authHeader requires a resolved API key") {
@@ -1597,8 +1597,9 @@ export class AgentSession {
 		}
 
 		try {
-			const storedResult = await this._modelRuntime.getAuth(model, { signal });
-			const activeApiKey = await this.agent.getApiKey?.(model.provider);
+			const storedResult = await this._modelRuntime.getAuth(model, { signal, sessionId: this.sessionId });
+			const activeApiKey =
+				storedResult?.source === "OAuth" ? undefined : await this.agent.getApiKey?.(model.provider);
 			const result =
 				activeApiKey !== undefined && storedResult?.source !== "OAuth"
 					? await this._modelRuntime.getAuth(model, { apiKey: activeApiKey, signal })
@@ -8912,7 +8913,10 @@ export class AgentSession {
 				// cancel it (#9777). _executeCompaction resolves the policy-specific
 				// auth after extension compaction hooks have had a chance to provide a
 				// summary without credentials.
-				await this._modelRuntime.getAuth(this.model, { signal: autoCompactionController.signal });
+				await this._modelRuntime.getAuth(this.model, {
+					signal: autoCompactionController.signal,
+					sessionId: this.sessionId,
+				});
 			} catch (error) {
 				if (isSuperseded()) return false;
 				if (autoCompactionController.signal.aborted) return endBeforeExecution();

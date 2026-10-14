@@ -8,6 +8,8 @@ import { OAuthRefreshUnavailableError } from "@earendil-works/pi-ai/utils/oauth-
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTerminalFailureAssistantMessage } from "../../../agent/src/assistant-terminal-state.ts";
 import { lazyStream } from "../../../ai/src/api/lazy.ts";
+import { OAuthRefreshExchangeError } from "../../../ai/src/auth/oauth-refresh.ts";
+import { oauthRefreshModelsError } from "../../../ai/src/auth/resolve.ts";
 import { createModels, createProvider } from "../../../ai/src/models.ts";
 import { classifyCredentialFailure } from "../../src/core/credential-pool/classify.ts";
 import { streamWithCredentialRotation } from "../../src/core/credential-pool/rotation-stream.ts";
@@ -194,6 +196,130 @@ describe("OAuth same-model recovery (#2893)", () => {
 			kind: "fail_request",
 		});
 	});
+
+	it("fails over when a refresh token is invalidated without a structured HTTP status", () => {
+		// Given the error emitted by the ChatGPT refresh exchange.
+		const failure = oauthRefreshModelsError(
+			new OAuthRefreshExchangeError(
+				new Error(
+					'ChatGPT Subscription token refresh failed (401): {"error":{"code":"refresh_token_invalidated"}}',
+				),
+			),
+			"faux",
+		);
+
+		// When the pool classifies the refresh rejection.
+		const action = classifyCredentialFailure(failure);
+
+		// Then only this credential is blocked, allowing a healthy sibling.
+		expect(action).toEqual({ kind: "failover", block: { reason: "auth_error" } });
+	});
+
+	it.each(["turn", "compaction", "provider authentication", "exhausted pool"] as const)(
+		"handles %s when the pinned refresh token is invalidated",
+		async (operation) => {
+			// Given an expired, pinned login and a healthy sibling.
+			const harness = await createHarness({
+				withConfiguredAuth: false,
+				settings: {
+					compaction: {
+						enabled: false,
+						keepRecentTokens: 1,
+						speculativeEnabled: false,
+						idleCompactionEnabled: false,
+					},
+					retry: { enabled: false },
+				},
+			});
+			harnesses.push(harness);
+			const runtime = getModelRuntime(harness.modelRegistry);
+			const refreshes: string[] = [];
+			const credential = {
+				...stale,
+				pinned: "default",
+				accounts: [
+					{ name: "default", access: stale.access, refresh: stale.refresh, expires: 1, source: "login" as const },
+					{
+						name: "healthy",
+						access: "healthy-access",
+						refresh: "healthy-refresh",
+						expires: operation === "exhausted pool" ? 1 : Date.now() + 3_600_000,
+						source: "login" as const,
+					},
+				],
+			};
+			await harness.authStorage.modify("faux", async () => credential);
+			await runtime.registerNativeProvider(
+				createProvider({
+					id: "faux",
+					name: "fixture",
+					api: { stream: streamSimple, streamSimple },
+					baseUrl: "https://fixture.example",
+					models: harness.models,
+					auth: {
+						oauth: {
+							name: "fixture",
+							login: async () => stale,
+							refresh: async (current) => {
+								refreshes.push(current.refresh);
+								throw new Error(
+									'ChatGPT Subscription token refresh failed (401): {"error":{"code":"refresh_token_invalidated"}}',
+								);
+							},
+							toAuth: async (current) => ({ apiKey: current.access }),
+						},
+					},
+				}),
+			);
+			await runtime.refresh({ allowNetwork: false, providers: ["faux"] });
+			refreshes.length = 0;
+			harness.agent.streamFunction = (model, context, options) => runtime.streamSimple(model, context, options);
+			if (operation === "compaction") {
+				for (let i = 0; i < 4; i++) {
+					harness.sessionManager.appendMessage({
+						role: "user",
+						content: `history ${i} `.repeat(100),
+						timestamp: i,
+					});
+					harness.sessionManager.appendMessage(fauxAssistantMessage(`answer ${i} `.repeat(100)));
+				}
+				harness.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+			}
+			harness.setResponses([fauxAssistantMessage("recovered"), fauxAssistantMessage("prefix summary")]);
+
+			// When a real session turn or compaction needs authentication.
+			if (operation === "provider authentication") {
+				const auth = await runtime.getAuth("faux");
+				expect(auth?.auth.apiKey).toBe("healthy-access");
+				expect(refreshes).toEqual(["fixture-refresh"]);
+				expect(harness.faux.getCallLog()).toEqual([]);
+				return;
+			}
+			if (operation === "exhausted pool") {
+				await expect(runtime.getAuth(harness.getModel())).rejects.toMatchObject({
+					action: { kind: "failover", block: { reason: "auth_error" } },
+				});
+				// Every login is attempted once, with no provider call or retry loop.
+				expect(refreshes).toEqual(["fixture-refresh", "healthy-refresh"]);
+				expect(harness.faux.getCallLog()).toEqual([]);
+				return;
+			}
+			if (operation === "turn") await harness.session.prompt("hello");
+			else await harness.session.compact();
+
+			// Then it uses the healthy login without a model switch or turn retry.
+			expect(harness.faux.getCallLog().length).toBeGreaterThan(0);
+			expect(harness.faux.getCallLog().every((call) => call.options?.apiKey === "healthy-access")).toBe(true);
+			expect(refreshes.filter((refresh) => refresh === stale.refresh)).toHaveLength(1);
+			expect(harness.eventsOfType("model_changed")).toEqual([]);
+			expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+			if (operation === "turn") {
+				expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+			} else {
+				expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
+			}
+		},
+	);
 
 	it.each(["standard", "custom"] as const)(
 		"compacts through %s auth after exactly one authentication retry",

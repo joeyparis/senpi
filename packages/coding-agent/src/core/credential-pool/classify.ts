@@ -1,7 +1,10 @@
 import { PROVIDER_NOT_CONFIGURED_PREFIX } from "@earendil-works/pi-ai";
 import { DEFAULT_SLOT_BLOCK_MS, MAX_SLOT_BLOCK_MS } from "@earendil-works/pi-ai/auth/pool/failover";
 import { normalizeProviderError } from "@earendil-works/pi-ai/utils/error-body";
-import { isOAuthRefreshUnavailableError } from "@earendil-works/pi-ai/utils/oauth-refresh-error";
+import {
+	isOAuthRefreshRejectedError,
+	isOAuthRefreshUnavailableError,
+} from "@earendil-works/pi-ai/utils/oauth-refresh-error";
 import { getOverflowPatterns } from "@earendil-works/pi-ai/utils/overflow";
 import { extract429RetryAfterMs } from "@earendil-works/pi-ai/utils/retry-hint";
 import { rateLimitModelFamily } from "./model-scope.ts";
@@ -90,6 +93,9 @@ export function classifyCredentialFailure(
 ): CredentialAction {
 	if (isOAuthRefreshUnavailableError(error)) {
 		return { kind: "retry_same", maxAttempts: RETRY_SAME_MAX_ATTEMPTS };
+	}
+	if (isOAuthRefreshRejectedError(error)) {
+		return { kind: "failover", block: { reason: "auth_error" } };
 	}
 	const normalized = normalizeProviderError(error);
 	const text = normalized.messageCarriesBody ? normalized.message : `${normalized.message} ${normalized.body ?? ""}`;

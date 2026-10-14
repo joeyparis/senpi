@@ -1,3 +1,23 @@
+## 2026-10-14 - Preserve permanent refresh rejection for credential failover
+
+### What changed
+
+- `packages/ai/src/auth/resolve.ts`: permanent OAuth exchange failures retain their existing error code, message and cause in a symbol-branded rejection error.
+- `packages/ai/src/auth/resolve.ts`: OAuth-only providers resolve an explicit request token against its matching saved login, preserving that login's authentication checks and metadata instead of refreshing the flat default again. Unmatched API keys retain ordinary OAuth resolution.
+
+### Why
+
+- An invalidated refresh token could reach a credential pool without a structured HTTP status, so it failed the request instead of selecting a healthy login.
+- Compaction could resolve a healthy pooled token but lose it when the subsequent OAuth-only request ignored the explicit token override.
+
+### Why an extension could not handle it
+
+- `packages/ai/src/auth/resolve.ts` maps authentication failures before provider requests and extension recovery hooks.
+
+### Expected merge conflict zones
+
+- `packages/ai/src/auth/resolve.ts`: OAuth error imports, request-token overrides and `oauthRefreshModelsError`.
+
 ## 2026-10-09 - Restore auth-tracker coverage for upstream-modified paths (senpi#3006)
 
 ### What changed

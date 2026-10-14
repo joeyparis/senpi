@@ -1,3 +1,28 @@
+## 2026-10-14 - Recover invalidated refresh tokens in turns and compaction
+
+### What changed
+
+- `packages/coding-agent/src/core/credential-pool/classify.ts`: typed permanent OAuth refresh rejections block only the affected credential and fail over, while transient refresh failures keep same-slot retry.
+- `packages/coding-agent/src/core/credential-pool/rotation-stream.ts`: authentication-only requests reuse the streaming pool's selection, bounded retries, persisted credential blocks and cleanup.
+- `packages/coding-agent/src/core/model-runtime.ts`: model and provider-level authentication without an explicit slot or API key resolves through the configured credential pool even when a failed availability check left the snapshot stale; an optional session ID preserves affinity.
+- `packages/coding-agent/src/core/agent-session.ts`: compaction and summarization pass session affinity and avoid resolving the legacy API-key projection after OAuth authentication already succeeded.
+
+### Why
+
+- Re-login adds a healthy account without removing the old one. Session affinity could keep a turn on an invalidated login because the refresh error lost its status, and compaction bypassed the pool to resolve the stale flat credential.
+
+### Why an extension could not handle it
+
+- `packages/coding-agent/src/core/credential-pool/classify.ts` and `packages/coding-agent/src/core/credential-pool/rotation-stream.ts` own credential recovery below provider dispatch.
+- `packages/coding-agent/src/core/model-runtime.ts` owns request authentication, and `packages/coding-agent/src/core/agent-session.ts` resolves compaction authentication before extensions can supply a summary.
+
+### Expected merge conflict zones
+
+- `packages/coding-agent/src/core/credential-pool/classify.ts`: OAuth imports and the structured-error branches.
+- `packages/coding-agent/src/core/credential-pool/rotation-stream.ts`: rotation option types and the shared failover factory.
+- `packages/coding-agent/src/core/model-runtime.ts`: authentication overrides and `getAuth`.
+- `packages/coding-agent/src/core/agent-session.ts`: summarization authentication and automatic-compaction admission.
+
 ## 2026-10-14 - A network blip falls back for one turn at most and never opens the fallback circuit (senpi#3306)
 
 ### What changed

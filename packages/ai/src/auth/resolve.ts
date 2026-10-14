@@ -1,14 +1,18 @@
 import type { ProviderEnv } from "../types.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { ModelsError } from "../utils/models-error.ts";
-import { classifyOAuthRefreshFailure, OAuthRefreshUnavailableError } from "../utils/oauth-refresh-error.ts";
+import {
+	classifyOAuthRefreshFailure,
+	OAuthRefreshRejectedError,
+	OAuthRefreshUnavailableError,
+} from "../utils/oauth-refresh-error.ts";
 import {
 	OAuthRefreshExchangeError,
 	OAuthRefreshStoreError,
 	projectOAuthSlot,
 	refreshOAuthCredential,
 } from "./oauth-refresh.ts";
-import { projectSlot } from "./pool/slots.ts";
+import { listSlots, projectSlot } from "./pool/slots.ts";
 
 export { ModelsError, type ModelsErrorCode } from "../utils/models-error.ts";
 
@@ -101,6 +105,24 @@ async function resolveProviderAuthWithSignal(
 	}
 
 	const stored = await readCredential(credentials, provider.id, signal);
+	if (overrides?.apiKey !== undefined && !apiKey && stored?.type === "oauth" && provider.auth.oauth) {
+		const resolved_slot = listSlots(stored).find((slot) => slot.access === overrides.apiKey);
+		const resolved_credential = resolved_slot && projectSlot(stored, resolved_slot.name);
+		if (resolved_credential?.type === "oauth") {
+			return resolveStoredOAuth(
+				credentials,
+				provider.id,
+				provider.auth.oauth,
+				resolved_credential,
+				requestAuthContext,
+				overrides.env,
+				signal,
+				overrides.minOAuthValidityMs,
+				resolved_slot?.name,
+				overrides.rejectedAccess,
+			);
+		}
+	}
 	const slotName = overrides?.slotName;
 	if (slotName !== undefined) {
 		const projected = stored === undefined ? undefined : projectSlot(stored, slotName);
@@ -183,7 +205,7 @@ export function oauthRefreshModelsError(error: unknown, providerId: string): Mod
 		if (classifyOAuthRefreshFailure(error.cause) === "transient") {
 			return new OAuthRefreshUnavailableError(providerId, error.cause);
 		}
-		return new ModelsError("oauth", `OAuth refresh failed for ${providerId}`, { cause: error.cause });
+		return new OAuthRefreshRejectedError(providerId, error.cause);
 	}
 	const cause = error instanceof OAuthRefreshStoreError ? error.cause : error;
 	return new ModelsError("auth", `Credential store modify failed for ${providerId}`, { cause });

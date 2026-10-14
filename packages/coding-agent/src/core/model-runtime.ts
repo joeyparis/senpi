@@ -175,6 +175,8 @@ export interface ModelRuntimeAuthOverrides extends AuthOperationOptions {
 	slotName?: string;
 	/** An OAuth access token the provider just refused; a stored credential still carrying it is re-exchanged. */
 	rejectedAccess?: string;
+	/** Keep auxiliary authentication on the same credential affinity as the session. */
+	sessionId?: string;
 }
 
 /**
@@ -764,8 +766,39 @@ export class ModelRuntime implements Models {
 		providerOrModel: string | AnyModel,
 		overrides: ModelRuntimeAuthOverrides = {},
 	): Promise<AuthResult | undefined> {
-		if (typeof providerOrModel === "string") return this.models.getAuth(providerOrModel, overrides);
-		const resolution = await this.models.getAuth(providerOrModel, overrides);
+		const provider_id = typeof providerOrModel === "string" ? providerOrModel : providerOrModel.provider;
+		const resolve_auth = (selected_overrides: ModelRuntimeAuthOverrides) =>
+			typeof providerOrModel === "string"
+				? this.models.getAuth(providerOrModel, selected_overrides)
+				: this.models.getAuth(providerOrModel, selected_overrides);
+		const rotation_sources =
+			(typeof providerOrModel === "string" || isModelType(providerOrModel, "chat")) &&
+			overrides.slotName === undefined &&
+			overrides.apiKey === undefined &&
+			!this.credentials.hasRuntimeApiKey(provider_id) &&
+			this.config.getProvider(provider_id)?.credentials?.rotation !== false
+				? await this.credentialRotationSources({ provider: provider_id }, overrides)
+				: undefined;
+		let resolution: AuthResult | undefined;
+		if (rotation_sources) {
+			const { rotation } = await this.loadCredentialPool();
+			resolution = await rotation.resolveAuthWithCredentialRotation({
+				sources: rotation_sources,
+				...(typeof providerOrModel === "string" ? {} : { modelId: providerOrModel.id }),
+				...(overrides.sessionId === undefined ? {} : { affinityKey: overrides.sessionId }),
+				resolve: async (slot) => {
+					const auth_result = await resolve_auth({
+						...overrides,
+						...(slot.lane === "env" ? { apiKey: slot.envKey } : { slotName: slot.name }),
+					});
+					if (!auth_result) throw new ModelsError("auth", providerNotConfiguredMessage(provider_id));
+					return auth_result;
+				},
+			});
+		} else {
+			resolution = await resolve_auth(overrides);
+		}
+		if (typeof providerOrModel === "string") return resolution;
 		if (!resolution) return undefined;
 		const configuredHeaders = await resolveConfiguredModelHeaders(
 			providerOrModel,
@@ -974,7 +1007,7 @@ export class ModelRuntime implements Models {
 	}
 
 	private async credentialRotationSources(
-		model: Model<Api>,
+		model: Pick<Model<Api>, "provider">,
 		options: CredentialRotationStreamOptions | undefined,
 	): Promise<RotationSources | undefined> {
 		const env = (name: string) => options?.env?.[name] ?? process.env[name];

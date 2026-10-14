@@ -1,3 +1,21 @@
+## 2026-10-14 - Brand rejected OAuth refreshes across bundle boundaries
+
+### What changed
+
+- `packages/ai/src/utils/oauth-refresh-error.ts`: add a permanent-refresh rejection error and a bounded, cycle-safe predicate recognizing its symbol through wrapped causes and separate bundles.
+
+### Why
+
+- Provider status fields and instance identity do not survive every authentication wrapper or bundle boundary.
+
+### Why an extension could not handle it
+
+- `packages/ai/src/utils/oauth-refresh-error.ts` supplies shared structured authentication failures consumed below extension recovery hooks.
+
+### Expected merge conflict zones
+
+- `packages/ai/src/utils/oauth-refresh-error.ts`: rejection brand, error class and cause predicate beside the transient-refresh brand.
+
 ## 2026-10-14 - Anthropic third-party billing rejection is terminal account exhaustion with its own explanation (senpi#3259)
 
 ### What changed

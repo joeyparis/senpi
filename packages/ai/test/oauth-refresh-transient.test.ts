@@ -4,6 +4,7 @@ import { OAuthRefreshExchangeError } from "../src/auth/oauth-refresh.ts";
 import { oauthRefreshModelsError, resolveProviderAuth } from "../src/auth/resolve.ts";
 import {
 	classifyOAuthRefreshFailure,
+	isOAuthRefreshRejectedError,
 	isOAuthRefreshUnavailableError,
 	OAuthTokenEndpointError,
 } from "../src/utils/oauth-refresh-error.ts";
@@ -42,6 +43,7 @@ describe("transient OAuth refresh failures (#2893)", () => {
 		expect(classifyOAuthRefreshFailure(cause)).toBe(classification);
 		const mapped = oauthRefreshModelsError(new OAuthRefreshExchangeError(cause), "fixture");
 		expect(isOAuthRefreshUnavailableError(mapped)).toBe(classification === "transient");
+		expect(isOAuthRefreshRejectedError(mapped)).toBe(classification === "permanent");
 		expect(mapped.code).toBe("oauth");
 	});
 
@@ -55,11 +57,25 @@ describe("transient OAuth refresh failures (#2893)", () => {
 		expect(isOAuthRefreshUnavailableError(new Error("OAuth refresh unavailable"))).toBe(false);
 	});
 
+	it("recognizes rejected refreshes across bundle copies and wrapped pool errors", () => {
+		// Given an error from another bundle, wrapped by credential failover.
+		const rejection = { [Symbol.for("senpi.oauthRefreshRejected")]: true };
+		const wrapped = new Error("pool exhausted", { cause: rejection });
+
+		// When authentication recovery inspects the structured failure.
+		const rejected = isOAuthRefreshRejectedError(wrapped);
+
+		// Then it remains credential-scoped without matching provider prose.
+		expect(rejected).toBe(true);
+		expect(isOAuthRefreshRejectedError(new Error("refresh_token_invalidated"))).toBe(false);
+	});
+
 	it("terminates safely on cyclic causes", () => {
 		const cycle = new Error("unknown");
 		cycle.cause = cycle;
 		expect(classifyOAuthRefreshFailure(cycle)).toBe("permanent");
 		expect(isOAuthRefreshUnavailableError(cycle)).toBe(false);
+		expect(isOAuthRefreshRejectedError(cycle)).toBe(false);
 	});
 
 	it("keeps stored credentials byte-identical on failure and recovers on the next exchange", async () => {
@@ -95,6 +111,55 @@ describe("transient OAuth refresh failures (#2893)", () => {
 		expect(JSON.stringify(warn.mock.calls)).not.toContain("fixture-refresh");
 		expect((await resolveProviderAuth(provider, credentials, context))?.auth.apiKey).toBe("fixture-next");
 		expect(calls).toBe(2);
+	});
+
+	it("uses a resolved request token instead of refreshing an OAuth-only provider's stale default", async () => {
+		// Given a previously resolved token and an invalidated stored default.
+		const credentials = new InMemoryCredentialStore();
+		const stored = {
+			type: "oauth" as const,
+			access: "stale-access",
+			refresh: "stale-refresh",
+			expires: 1,
+			accounts: [
+				{ name: "default", access: "stale-access", refresh: "stale-refresh", expires: 1, source: "login" as const },
+				{
+					name: "healthy",
+					access: "healthy-access",
+					refresh: "healthy-refresh",
+					expires: Date.now() + 3_600_000,
+					source: "login" as const,
+				},
+			],
+		};
+		await credentials.modify("fixture", async () => stored);
+		const refresh = vi.fn(async () => {
+			throw new OAuthTokenEndpointError("refresh_token_invalidated", 401);
+		});
+		const provider = {
+			id: "fixture",
+			auth: {
+				oauth: {
+					name: "fixture",
+					login: async () => stored,
+					refresh,
+					toAuth: async (credential: { access: string }) => ({ apiKey: credential.access }),
+				},
+			},
+		};
+
+		// When an auxiliary request reuses that resolved authentication.
+		const auth = await resolveProviderAuth(
+			provider,
+			credentials,
+			{ env: async () => undefined, fileExists: async () => false },
+			{ apiKey: "healthy-access" },
+		);
+
+		// Then the request uses that token without another refresh or store mutation.
+		expect(auth?.auth.apiKey).toBe("healthy-access");
+		expect(refresh).not.toHaveBeenCalled();
+		expect(await credentials.read("fixture")).toEqual(stored);
 	});
 
 	it("propagates caller abort rather than an exchange failure", async () => {

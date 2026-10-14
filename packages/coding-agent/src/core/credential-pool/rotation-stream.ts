@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
+import type { AssistantMessageEvent, AuthResult } from "@earendil-works/pi-ai";
 import { rendezvousOrder, type SlotHasher } from "@earendil-works/pi-ai/auth/pool/select";
 import { AUTH_BLOCK_REPROBE_MS } from "./auth-reprobe.ts";
 import { type CredentialBlock, classifyCredentialFailure } from "./classify.ts";
-import { runCredentialFailover } from "./failover.ts";
+import { type RunCredentialFailoverOptions, runCredentialFailover } from "./failover.ts";
 import { modelBlockKey, pruneModelBlocks, withModelBlock } from "./model-scope.ts";
 import { isCommittedRotationOutput, isRotationStreamStart, rotationErrorFromEvent } from "./rotation-events.ts";
 import { listRotationSlots, type RotationSlot, type RotationSources } from "./rotation-slots.ts";
@@ -77,16 +77,14 @@ function blockPatch(
 	return { ...base, blockReason: block.reason };
 }
 
-export type CredentialRotationOptions = {
+export type CredentialRotationOptions<TEvent = AssistantMessageEvent> = {
 	sources: RotationSources;
 	/** Stable session key keeps a session on its slot; absent, each request distributes. */
 	affinityKey?: string;
 	/** The requested model: a limit naming its family blocks only that family on the slot (senpi#2555). */
 	modelId?: string;
 	hasher?: SlotHasher;
-	runAttempt: (
-		slot: RotationSlot,
-	) => AsyncIterable<AssistantMessageEvent> | Promise<AsyncIterable<AssistantMessageEvent>>;
+	runAttempt: (slot: RotationSlot) => AsyncIterable<TEvent> | Promise<AsyncIterable<TEvent>>;
 };
 
 /**
@@ -99,13 +97,48 @@ export type CredentialRotationOptions = {
 export function streamWithCredentialRotation(
 	options: CredentialRotationOptions,
 ): AsyncGenerator<AssistantMessageEvent> {
+	return rotateCredentials(options, {
+		isCommittedOutput: isCommittedRotationOutput,
+		isStreamStart: isRotationStreamStart,
+		errorFromEvent: rotationErrorFromEvent,
+	});
+}
+
+/** Authentication-only callers share streaming selection, blocks and bounded failover. */
+export async function resolveAuthWithCredentialRotation(
+	options: Omit<CredentialRotationOptions<AuthResult>, "runAttempt"> & {
+		resolve: (slot: RotationSlot) => Promise<AuthResult>;
+	},
+): Promise<AuthResult | undefined> {
+	let auth_result: AuthResult | undefined;
+	for await (const resolved of rotateCredentials(
+		{
+			...options,
+			runAttempt: async function* (slot) {
+				yield await options.resolve(slot);
+			},
+		},
+		{ isCommittedOutput: () => true },
+	)) {
+		auth_result = resolved;
+	}
+	return auth_result;
+}
+
+function rotateCredentials<TEvent>(
+	options: CredentialRotationOptions<TEvent>,
+	events: Pick<
+		RunCredentialFailoverOptions<TEvent, RotationSlot>,
+		"isCommittedOutput" | "isStreamStart" | "errorFromEvent"
+	>,
+): AsyncGenerator<TEvent> {
 	const { sources, runAttempt } = options;
 	const hasher = options.hasher ?? sha256SlotHasher;
 	const affinityKey = options.affinityKey ?? randomUUID();
 	const useAffinity = sources.policy?.affinity !== false;
 	const now = sources.now ?? Date.now;
 
-	return runCredentialFailover<AssistantMessageEvent, RotationSlot>({
+	return runCredentialFailover<TEvent, RotationSlot>({
 		listSlots: () => listRotationSlots(sources, options.modelId === undefined ? {} : { modelId: options.modelId }),
 		select: (candidates) => {
 			const pinned = candidates.find((candidate) => candidate.pinned === true);
@@ -117,9 +150,7 @@ export function streamWithCredentialRotation(
 			return winner;
 		},
 		runAttempt,
-		isCommittedOutput: isCommittedRotationOutput,
-		isStreamStart: isRotationStreamStart,
-		errorFromEvent: rotationErrorFromEvent,
+		...events,
 		classify: (error, context) =>
 			classifyCredentialFailure(error, {
 				...context,
