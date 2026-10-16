@@ -23,7 +23,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
 import { AuthStorage } from "./auth-storage.ts";
-import type { ModelRuntime } from "./model-runtime.ts";
+import type { ModelRuntime, ModelRuntimeAuthOverrides } from "./model-runtime.ts";
 import { ModelRuntime as DefaultModelRuntime } from "./model-runtime.ts";
 import type { AuthStatus, ProviderConfigInput } from "./provider-composer.ts";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "./provider-display-names.ts";
@@ -42,7 +42,7 @@ export type ResolvedRequestAuth =
 			env?: Record<string, string>;
 			ambient?: true;
 	  }
-	| { ok: false; error: string };
+	| { ok: false; error: string; cause?: unknown };
 export { clearApiKeyCache } from "./provider-composer.ts";
 
 /**
@@ -138,9 +138,12 @@ export class ModelRegistry {
 		return this.runtime.getCompatibilityRequestConfig(model).serviceTier;
 	}
 
-	async getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedRequestAuth> {
+	async getApiKeyAndHeaders(
+		model: Model<Api>,
+		options?: Pick<ModelRuntimeAuthOverrides, "signal" | "sessionId">,
+	): Promise<ResolvedRequestAuth> {
 		try {
-			const resolution = await this.runtime.getAuth(model);
+			const resolution = await this.runtime.getAuth(model, options);
 			const compatibility = this.runtime.getCompatibilityRequestConfig(model);
 			if (!resolution) {
 				if (compatibility.authHeader) {
@@ -166,6 +169,7 @@ export class ModelRegistry {
 				cause instanceof Error ? cause.message : error instanceof Error ? error.message : String(error);
 			return {
 				ok: false,
+				cause: error,
 				error:
 					message === "authHeader requires a resolved API key"
 						? `No API key found for "${model.provider}"`

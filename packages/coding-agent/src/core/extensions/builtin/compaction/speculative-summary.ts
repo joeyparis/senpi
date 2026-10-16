@@ -154,13 +154,17 @@ export async function generateSummaryMessage(options: {
 			),
 			...(options.snapshot.tools && options.snapshot.tools.length > 0 ? { tools: options.snapshot.tools } : {}),
 		};
-		const headers = providerRequest
-			? await providerRequest.transformHeaders(options.auth.headers ?? {})
-			: options.auth.headers;
+		const runtime = options.context.modelRegistry?.modelRuntime;
+		const headers =
+			!runtime && providerRequest
+				? await providerRequest.transformHeaders(options.auth.headers ?? {})
+				: options.auth.headers;
 		const responseStream = summarizationStream(options.context, options.snapshot.model, requestContext, {
 			apiKey: options.auth.apiKey,
 			headers,
+			...(runtime && providerRequest ? { transformHeaders: providerRequest.transformHeaders } : {}),
 			extraBody: options.auth.extraBody,
+			sessionId: options.context.sessionManager.getSessionId(),
 			onPayload: async (payload, model) => {
 				const sanitized = model.api === "anthropic-messages" ? sanitizeAnthropicPayload(payload) : payload;
 				return providerRequest ? await providerRequest.transformPayload(sanitized) : sanitized;

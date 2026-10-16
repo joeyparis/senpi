@@ -2,25 +2,55 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, isRetryableAssistantError } from "@earendil-works/pi-ai";
+import {
+	createAssistantMessageEventStream,
+	createModels,
+	createProvider,
+	fauxAssistantMessage,
+	isRetryableAssistantError,
+	lazyStream,
+} from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { OAuthRefreshUnavailableError } from "@earendil-works/pi-ai/utils/oauth-refresh-error";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTerminalFailureAssistantMessage } from "../../../agent/src/assistant-terminal-state.ts";
-import { lazyStream } from "../../../ai/src/api/lazy.ts";
 import { OAuthRefreshExchangeError } from "../../../ai/src/auth/oauth-refresh.ts";
 import { oauthRefreshModelsError } from "../../../ai/src/auth/resolve.ts";
-import { createModels, createProvider } from "../../../ai/src/models.ts";
 import { classifyCredentialFailure } from "../../src/core/credential-pool/classify.ts";
 import { streamWithCredentialRotation } from "../../src/core/credential-pool/rotation-stream.ts";
 import { CredentialSlotRepository } from "../../src/core/credential-pool/state-store.ts";
+import {
+	createSpeculativeCompactionSnapshot,
+	runExtensionCompaction,
+	type SpeculativeCompactionContext,
+} from "../../src/core/extensions/builtin/compaction/speculative.ts";
 import { getModelRuntime } from "../model-runtime-test-utils.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 const harnesses: Harness[] = [];
 const refused = () => Object.assign(new TypeError("opaque transport failure"), { code: "ConnectionRefused" });
 const stale = { type: "oauth" as const, access: "fixture-access", refresh: "fixture-refresh", expires: 1 };
+const recoveryOperations = [
+	"turn",
+	"compaction",
+	"extension compaction",
+	"provider authentication",
+	"exhausted pool",
+	"exhausted extension compaction",
+] as const;
 let home: string;
+
+function extensionCompactionContext(harness: Harness): SpeculativeCompactionContext {
+	return {
+		model: harness.getModel(),
+		modelRegistry: harness.modelRegistry,
+		sessionManager: harness.sessionManager,
+		getContextUsage: () => undefined,
+		getCompactionSettings: () => ({ enabled: true, reserveTokens: 16_384, keepRecentTokens: 1 }),
+		getMessageRevision: () => 1,
+		applyCompaction: async () => ({ applied: true, reason: "ok" }),
+	};
+}
 
 async function refusedTransport(): Promise<Error> {
 	const server = createServer();
@@ -215,8 +245,8 @@ describe("OAuth same-model recovery (#2893)", () => {
 		expect(action).toEqual({ kind: "failover", block: { reason: "auth_error" } });
 	});
 
-	it.each(["turn", "compaction", "provider authentication", "exhausted pool"] as const)(
-		"handles %s when the pinned refresh token is invalidated",
+	it.each(recoveryOperations)(
+		"handles %s during normal requests and extension summarization when the pinned OAuth refresh token is invalidated",
 		async (operation) => {
 			// Given an expired, pinned login and a healthy sibling.
 			const harness = await createHarness({
@@ -243,7 +273,7 @@ describe("OAuth same-model recovery (#2893)", () => {
 						name: "healthy",
 						access: "healthy-access",
 						refresh: "healthy-refresh",
-						expires: operation === "exhausted pool" ? 1 : Date.now() + 3_600_000,
+						expires: operation.startsWith("exhausted") ? 1 : Date.now() + 3_600_000,
 						source: "login" as const,
 					},
 				],
@@ -274,7 +304,7 @@ describe("OAuth same-model recovery (#2893)", () => {
 			await runtime.refresh({ allowNetwork: false, providers: ["faux"] });
 			refreshes.length = 0;
 			harness.agent.streamFunction = (model, context, options) => runtime.streamSimple(model, context, options);
-			if (operation === "compaction") {
+			if (operation.includes("compaction")) {
 				for (let i = 0; i < 4; i++) {
 					harness.sessionManager.appendMessage({
 						role: "user",
@@ -302,6 +332,26 @@ describe("OAuth same-model recovery (#2893)", () => {
 				// Every login is attempted once, with no provider call or retry loop.
 				expect(refreshes).toEqual(["fixture-refresh", "healthy-refresh"]);
 				expect(harness.faux.getCallLog()).toEqual([]);
+				return;
+			}
+			if (operation.includes("extension compaction")) {
+				const context = extensionCompactionContext(harness);
+				const snapshot = createSpeculativeCompactionSnapshot(context, { generation: 1 });
+				if (!snapshot) throw new Error("Expected compaction preparation");
+				const before = harness.sessionManager.getEntries();
+				if (operation === "exhausted extension compaction") {
+					await expect(runExtensionCompaction(context, snapshot)).rejects.toMatchObject({
+						kind: "auth",
+						cause: { action: { kind: "failover", block: { reason: "auth_error" } } },
+					});
+					expect(refreshes).toEqual(["fixture-refresh", "healthy-refresh"]);
+					expect(harness.faux.getCallLog()).toEqual([]);
+				} else {
+					expect((await runExtensionCompaction(context, snapshot))?.summary).toBe("recovered");
+					expect(harness.faux.getCallLog()[0]?.options?.apiKey).toBe("healthy-access");
+					expect(refreshes).toEqual(["fixture-refresh"]);
+				}
+				expect(harness.sessionManager.getEntries()).toEqual(before);
 				return;
 			}
 			if (operation === "turn") await harness.session.prompt("hello");
@@ -345,4 +395,66 @@ describe("OAuth same-model recovery (#2893)", () => {
 			expect(harness.eventsOfType("model_changed")).toEqual([]);
 		},
 	);
+
+	it("re-exchanges a refused access token during extension summarization", async () => {
+		// Given a valid-looking OAuth token that the provider has revoked.
+		const harness = await createHarness({ withConfiguredAuth: false });
+		harnesses.push(harness);
+		const runtime = getModelRuntime(harness.modelRegistry);
+		const credential = { ...stale, expires: Date.now() + 3_600_000 };
+		await harness.authStorage.modify("faux", async () => credential);
+		const refresh = vi.fn(async () => ({ ...credential, access: "renewed-access" }));
+		await runtime.registerNativeProvider(
+			createProvider({
+				id: "faux",
+				name: "fixture",
+				baseUrl: "https://fixture.example",
+				models: harness.models,
+				api: {
+					stream: (model, context, options) => {
+						if (options?.apiKey === "renewed-access") return streamSimple(model, context, options);
+						const result = createAssistantMessageEventStream();
+						const message = {
+							...fauxAssistantMessage("", { stopReason: "error", errorMessage: "Access token revoked" }),
+							providerDiagnostic: {
+								category: "auth" as const,
+								evidence: "structured_status" as const,
+								httpStatus: 401,
+							},
+						};
+						result.push({ type: "error", reason: "error", error: message });
+						result.end(message);
+						return result;
+					},
+					streamSimple,
+				},
+				auth: {
+					oauth: {
+						name: "fixture",
+						login: async () => credential,
+						refresh,
+						rejectedTokenStatuses: [401],
+						toAuth: async (current) => ({ apiKey: current.access }),
+					},
+				},
+			}),
+		);
+		for (let i = 0; i < 4; i++) {
+			harness.sessionManager.appendMessage({ role: "user", content: `history ${i} `.repeat(100), timestamp: i });
+			harness.sessionManager.appendMessage(fauxAssistantMessage(`answer ${i} `.repeat(100)));
+		}
+		const context = extensionCompactionContext(harness);
+		const snapshot = createSpeculativeCompactionSnapshot(context, { generation: 1 });
+		if (!snapshot) throw new Error("Expected compaction preparation");
+		harness.setResponses([fauxAssistantMessage("renewed summary")]);
+
+		// When summarization reaches request-time token recovery.
+		const result = await runExtensionCompaction(context, snapshot);
+
+		// Then exactly one re-exchange succeeds without changing models or losing history.
+		expect(result?.summary).toBe("renewed summary");
+		expect(refresh).toHaveBeenCalledOnce();
+		expect(harness.faux.getCallLog()[0]?.options?.apiKey).toBe("renewed-access");
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
+	});
 });

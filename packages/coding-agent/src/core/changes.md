@@ -1,3 +1,21 @@
+## 2026-10-16 - Preserve compaction authentication affinity and failure causes
+
+### What changed
+
+- `packages/coding-agent/src/core/model-registry.ts`: `getApiKeyAndHeaders` accepts the caller's abort signal and session ID for pooled authentication and retains the original failure as `cause` alongside its display message.
+
+### Why
+
+- Automatic compaction resolved credentials without session affinity or cancellation, then flattened refresh failures into text. Auxiliary requests must share the session's credential selection and preserve structured recovery information.
+
+### Why an extension could not handle it
+
+- `packages/coding-agent/src/core/model-registry.ts` is the compatibility facade that resolves credentials for builtin extensions; callers cannot supply affinity or recover a discarded cause without this contract.
+
+### Expected merge conflict zones
+
+- `packages/coding-agent/src/core/model-registry.ts`: `ResolvedRequestAuth` and `getApiKeyAndHeaders`.
+
 ## 2026-10-14 - Recover invalidated refresh tokens in turns and compaction
 
 ### What changed

@@ -104,7 +104,10 @@ type OpenAiRemoteCompactionContext = {
 	getSystemPrompt(): string;
 	model: Model<Api> | undefined;
 	modelRegistry: {
-		getApiKeyAndHeaders(model: Model<Api>): Promise<
+		getApiKeyAndHeaders(
+			model: Model<Api>,
+			options?: { signal?: AbortSignal; sessionId?: string },
+		): Promise<
 			| {
 					ok: true;
 					apiKey?: string;
@@ -578,7 +581,9 @@ export async function runOpenAiRemoteCompaction(
 		return undefined;
 	}
 
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	const sessionId = ctx.sessionManager.getSessionId();
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model, { signal: event.signal, sessionId });
+	event.signal.throwIfAborted();
 	if (!auth.ok) {
 		emit?.({
 			version: 1,
@@ -607,7 +612,7 @@ export async function runOpenAiRemoteCompaction(
 		branchEntries: event.branchEntries,
 		messages: providerRequest?.messages,
 		tokensBefore: event.preparation.tokensBefore,
-		promptCacheKey: ctx.sessionManager.getSessionId(),
+		promptCacheKey: sessionId,
 		serviceTier,
 	});
 	if (!request) {
@@ -681,6 +686,8 @@ export async function runOpenAiRemoteCompaction(
 	if (supportsOpenAiResponsesRemoteCompactionV2(requestModel)) {
 		// The v2 beta header is request-local, so the checkpoint keeps the origin every later
 		// turn presents; fingerprinting it made replay refuse every v2 checkpoint (senpi#2378).
+		// Keep the resolved API key on every stream attempt: it pins runtime OAuth
+		// resolution to this account after the checkpoint origin has been constructed.
 		const result = await attemptOpenAiResponsesV2Compaction({
 			auth: { apiKey: auth.apiKey, extraBody: auth.extraBody },
 			emit,
@@ -695,7 +702,7 @@ export async function runOpenAiRemoteCompaction(
 			providerRequest,
 			request,
 			requestId: event.requestId,
-			sessionId: ctx.sessionManager.getSessionId(),
+			sessionId,
 			stream: resolveRemoteStreamRunner(ctx, dependencies),
 			systemPrompt: ctx.getSystemPrompt(),
 			timeoutMs: remoteDeadline.nextAttemptMs(),

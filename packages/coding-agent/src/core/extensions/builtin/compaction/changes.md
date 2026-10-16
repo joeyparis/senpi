@@ -1,3 +1,27 @@
+## 2026-10-16 - Recover compaction OAuth without losing account provenance
+
+### What changed
+
+- `packages/coding-agent/src/core/extensions/builtin/compaction/speculative.ts`: authentication preflight carries session affinity and cancellation and retains the original auth failure. Runtime-backed summary requests no longer pin the preflight token or endpoint.
+- `packages/coding-agent/src/core/extensions/builtin/compaction/speculative-summary.ts`: the runtime authenticates each summary attempt and transforms its resolved headers, with the session ID carried into credential selection.
+- `packages/coding-agent/src/core/extensions/builtin/compaction/openai-remote.ts`: remote authentication uses the same session affinity and abort signal before constructing account-scoped checkpoint provenance.
+- `packages/coding-agent/src/core/extensions/builtin/compaction/index.ts`: checkpoint replay authentication uses the same session affinity.
+
+### Why
+
+- A revoked access token could not be re-exchanged during summarization because the preflight value was passed as an explicit API key. Remote checkpoints also require their authentication and replay to agree on the owning account rather than independently selecting credentials.
+
+### Why an extension could not handle it
+
+- These files implement the builtin compaction extension and its runtime request pipeline. A separate extension cannot repair pinned request authentication or change the provenance of a checkpoint already constructed here.
+
+### Expected merge conflict zones
+
+- `packages/coding-agent/src/core/extensions/builtin/compaction/speculative.ts`: auth preflight and summary request options.
+- `packages/coding-agent/src/core/extensions/builtin/compaction/speculative-summary.ts`: request-time header transforms and session ID.
+- `packages/coding-agent/src/core/extensions/builtin/compaction/openai-remote.ts`: remote auth resolution and cancellation.
+- `packages/coding-agent/src/core/extensions/builtin/compaction/index.ts`: the `before_provider_request` replay hook.
+
 ## 2026-10-12 - Retire Codex app-server compatibility (senpi#3167)
 
 ### What changed

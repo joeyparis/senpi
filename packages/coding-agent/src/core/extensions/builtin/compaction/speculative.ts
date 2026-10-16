@@ -196,8 +196,8 @@ function summaryRequestFailureKind(response: AssistantMessage): SummaryRequestFa
 export class SummaryGenerationError extends Error {
 	readonly kind: "auth" | "empty-summary";
 
-	constructor(kind: "auth" | "empty-summary", message: string) {
-		super(message);
+	constructor(kind: "auth" | "empty-summary", message: string, options?: ErrorOptions) {
+		super(message, options);
 		this.name = "SummaryGenerationError";
 		this.kind = kind;
 	}
@@ -278,7 +278,10 @@ export async function runExtensionCompaction(
 		selectedModel === snapshot.model
 			? snapshot
 			: { ...snapshot, model: selectedModel, contextWindow: selectedModel.contextWindow };
-	const auth = await context.modelRegistry?.getApiKeyAndHeaders(selectedModel);
+	const auth = await context.modelRegistry?.getApiKeyAndHeaders(selectedModel, {
+		signal,
+		sessionId: context.sessionManager.getSessionId(),
+	});
 	if (signal?.aborted) return undefined;
 	// A provider is authenticated for summarization by a resolved key, a credential
 	// request header, or ambient request-time auth. The ambient marker comes from the
@@ -286,11 +289,15 @@ export async function runExtensionCompaction(
 	// has none of these and is rejected before a request.
 	if (!auth?.ok || !(auth.apiKey || hasCredentialHeaders(auth.headers) || auth.ambient)) {
 		const detail = auth && !auth.ok ? auth.error : `no credentials resolved for provider "${selectedModel.provider}"`;
-		throw new SummaryGenerationError("auth", `summarization credentials unavailable: ${detail}`);
+		throw new SummaryGenerationError("auth", `summarization credentials unavailable: ${detail}`, {
+			cause: auth && !auth.ok ? auth.cause : undefined,
+		});
 	}
-	const requestSnapshot = auth.baseUrl
-		? { ...selectedSnapshot, model: { ...selectedModel, baseUrl: auth.baseUrl } }
-		: selectedSnapshot;
+	const runtime = context.modelRegistry?.modelRuntime;
+	const requestSnapshot =
+		!runtime && auth.baseUrl
+			? { ...selectedSnapshot, model: { ...selectedModel, baseUrl: auth.baseUrl } }
+			: selectedSnapshot;
 
 	const prompt = buildPrompt({
 		variant: requestSnapshot.promptVariant,
@@ -358,11 +365,9 @@ export async function runExtensionCompaction(
 						prompt,
 						signal,
 						snapshot: requestSnapshot,
-						auth: {
-							apiKey: auth.apiKey,
-							headers: auth.headers,
-							extraBody: auth.extraBody,
-						},
+						// The runtime resolves the live credential per attempt. Pinning
+						// this preflight token would disable rejected-token recovery.
+						auth: runtime ? {} : { apiKey: auth.apiKey, headers: auth.headers, extraBody: auth.extraBody },
 						...(reasoningOverrideRetrySpent ? { omitReasoningOptions: true } : {}),
 					});
 					if (
